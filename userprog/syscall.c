@@ -1,0 +1,606 @@
+#include "userprog/syscall.h"
+#include <stdio.h>
+#include <syscall-nr.h>
+#include "threads/interrupt.h"
+#include "threads/init.h"
+#include "threads/thread.h"
+#include "threads/vaddr.h"
+#include "threads/synch.h"
+#include "userprog/process.h"
+#include "userprog/pagedir.h"
+#include "filesys/filesys.h"
+#include "filesys/file.h"
+
+static void syscall_handler (struct intr_frame *);
+
+static struct mmap_list_entry *find_mmap_by_id(int mmap_id);
+static struct mmap_list_entry *find_mmap_by_fd(int fd);
+
+static int get_user (const uint8_t *);
+static bool put_user (uint8_t *, uint8_t);
+
+static void exit(int);
+
+void
+syscall_init (void) 
+{
+  intr_register_int (0x30, 3, INTR_ON, syscall_handler, "syscall");
+}
+
+static void
+syscall_handler (struct intr_frame *f UNUSED) 
+{
+  int syscall_number;
+
+
+  syscall_number =  get_user(f->esp);
+  
+  switch(syscall_number)
+  {
+    case(SYS_HALT):
+      {
+        power_off();
+        break;
+      }
+    case(SYS_EXIT):
+      {
+        int status = get_user(f->esp+4);
+        exit( status );
+      }
+    case(SYS_EXEC):
+      {
+        const char *file_name = get_user(f->esp+4);
+        
+        /* Check file_name validity */
+        if(file_name==NULL)
+          exit(-1);
+
+        get_user(file_name);
+        
+        f->eax = process_execute(file_name);
+        break;
+      }
+    case(SYS_WAIT):
+      {
+        int pid = get_user(f->esp+4);
+
+        f->eax = process_wait(pid);
+        break;
+      }
+    case(SYS_CREATE):
+      {
+        const char *name = get_user(f->esp+4);
+        unsigned initial_size = get_user(f->esp+8);
+
+        /* Check name validity */
+        if(name==NULL)
+          exit(-1);
+
+        get_user(name);
+        
+        f->eax = filesys_create(name, initial_size, REG_F);
+        break;
+      }
+    case(SYS_REMOVE):
+      {
+        const char *name = get_user(f->esp+4);
+
+        /* Check name validity */
+        if(name == NULL)
+          exit(-1);
+
+        get_user(name);
+
+        f->eax = filesys_remove(name);
+        break;
+      }
+    case(SYS_OPEN):
+      {
+        int i;
+        struct file **fd_table;
+        const char *name = get_user(f->esp+4);
+        struct file *file;
+
+        /* Check name validity */
+        if(name == NULL)
+          exit(-1);
+
+        get_user(name);
+        
+        file = filesys_open(name);
+        
+        /* File open failed */
+        if(!file)
+          {
+            f->eax = -1;
+            break;
+          }
+          
+        /* Assign fd to file */
+        fd_table = thread_current()->fd_table;
+        for(i=2;i<100;i++)
+        {
+          if(!fd_table[i])
+            break;
+        }
+
+        /* No more fd available */
+        if(i==100)
+        {
+          f->eax = -1;
+          file_close(file);
+        }
+        else
+        {
+          fd_table[i] = file;
+          f->eax = i;
+        }
+        break;
+      }
+    case(SYS_FILESIZE):
+      {
+        int fd = get_user(f->esp+4);
+        struct file **fd_table = thread_current()->fd_table;
+        
+        /* Invalid fd */
+        if(fd<2 || fd>=100 || fd_table[fd]==NULL)
+        {
+          f->eax = -1;
+          break;
+        }
+
+        f->eax = file_length(fd_table[fd]);
+        break;
+      }
+    case(SYS_READ):
+      {
+        int fd = get_user(f->esp+4);
+        uint8_t *buffer = get_user(f->esp+8);
+        unsigned size = get_user(f->esp+12);
+        struct file **fd_table = thread_current()->fd_table;
+        struct mmap_list_entry *entry;
+
+        get_user(buffer);
+        
+        /* If fd is 0, read from kbd */
+        if(fd==0)
+        {
+          int i;
+          uint8_t c;
+          for(i=0;i<size;i++)
+          {
+            c = input_getc();
+            if(!put_user(buffer++, c))
+              exit(-1); 
+          }
+          f->esp = size;
+          break;
+        }
+
+        /* Invalid fd */
+        if(fd<2 || fd>=100 || fd_table[fd]==NULL)
+        {
+          f->eax = -1;
+          break;
+        }
+
+        /* If file is directory file, return -1 */
+        if( inode_is_dir(file_get_inode(fd_table[fd])) )
+        {
+          f->eax = -1;
+          break;
+        }
+        
+        entry = find_mmap_by_fd(fd);
+        if(entry)
+        {
+          unsigned pos = file_tell(fd_table[fd]);
+          file_seek(fd_table[fd], pos+size);
+          memcpy(buffer, ((void *)entry->uaddr) + pos, size);
+          break;
+        }
+
+        f->eax = file_read(fd_table[fd], buffer, size);
+
+        break;
+      }
+    case(SYS_WRITE):
+      {
+        int fd = get_user(f->esp+4);
+        const void *buffer = get_user(f->esp+8);
+        unsigned size = get_user(f->esp+12);
+        struct file **fd_table = thread_current()->fd_table;
+
+        get_user(buffer);
+
+        if(fd==1)
+        {
+          putbuf(buffer, size);
+          f->eax = size;
+          break;
+        }
+
+        /* Invalid fd */
+        if(fd<2 || fd>=100 || fd_table[fd]==NULL)
+        {
+          f->eax = -1;
+          break;
+        }
+
+        /* If file is directory file, return -1 */
+        if( inode_is_dir(file_get_inode(fd_table[fd])) )
+        {
+          f->eax = -1;
+          break;
+        }
+        
+        f->eax = file_write(fd_table[fd], buffer, size);
+        break;
+      }
+    case(SYS_SEEK):
+      {
+        int fd = get_user(f->esp+4);
+        unsigned position = get_user(f->esp+8);
+        struct file **fd_table;
+
+        fd_table = thread_current()->fd_table;
+
+        /* Invalid fd */
+        if(fd<2 || fd>=100 || fd_table[fd]==NULL)
+        {
+          f->eax = -1;
+          break;
+        }
+
+        file_seek(fd_table[fd], position);
+        break;
+      }
+    case(SYS_TELL):
+      {
+        int fd = get_user(f->esp+4);
+        struct file **fd_table = thread_current()->fd_table;
+
+        /* Invalid fd */
+        if(fd<2 || fd>=100 || fd_table[fd]==NULL)
+        {
+          f->eax = -1;
+          break;
+        }
+
+
+        f->eax = file_tell(fd_table[fd]);
+        break;
+      }
+    case(SYS_CLOSE):
+      {
+        int fd = get_user(f->esp+4);
+        struct file **fd_table = thread_current()->fd_table;
+
+        /* Invalid fd */
+        if(fd<2 || fd>=100 || fd_table[fd]==NULL)
+        {
+          f->eax = -1;
+          break;
+        }
+
+
+        /* close file */
+        file_close(fd_table[fd]);
+        fd_table[fd] = NULL;
+
+        break;
+      }
+    case(SYS_MMAP):
+      {
+        int fd = get_user(f->esp+4);
+        void *uaddr = get_user(f->esp+8);
+        struct thread *curr = thread_current();
+        struct file **fd_table = curr->fd_table;
+        struct list *mmap_list = &curr->mmap_list;
+        struct mmap_list_entry *entry;
+        struct file *mmap_file;
+        int length, page_cnt, mmap_fd, i;
+        bool overlap = false;
+
+        /* Check FD validity */
+        if( fd<2 || fd>=100 || fd_table[fd]==NULL || file_length(fd_table[fd])==0 )
+        {
+          f->eax = -1;
+          break;
+        }
+
+        /* Check if fd is already mmapped */
+        entry = find_mmap_by_fd(fd);
+        if(entry)
+        {
+          f->eax = -1;
+          break;
+        }
+ 
+
+        /* Check UADDR validity */
+        if(is_kernel_vaddr(((void *)uaddr)+file_length(fd_table[fd])))
+        {
+          f->eax = -1;
+          break;
+        }
+        if( (uaddr == 0) || ((int)uaddr%PGSIZE != 0) )
+        {
+          f->eax = -1;
+          break;
+        }
+        
+        /* Configure file length and number of pages needed */
+        length = file_length(fd_table[fd]);
+        page_cnt = (length+(PGSIZE-1))/PGSIZE;
+        
+        /* Now, there is no more need to use file interface */
+
+        /* Check if UADDR range overlaps with other pages */
+        for(i=0;i<page_cnt;i++)
+        {
+          if(lookup_sup_pte(curr, uaddr + PGSIZE*i))
+          {
+            overlap = true;
+            break;
+          }
+        }
+        if(overlap)
+        {
+          f->eax = -1;
+          break;
+        }
+
+        /* Reopen file for mmap */
+        mmap_file = file_reopen(fd_table[fd]);
+
+        /* Allocate fd for mmap_file */
+        for(mmap_fd=100;mmap_fd<200;mmap_fd++)
+        {
+          if(fd_table[mmap_fd]==NULL)
+            break;
+        }
+        if(mmap_fd==200)
+        {
+          f->eax = -1;
+          break;
+        }
+        fd_table[mmap_fd] = mmap_file;
+
+        /* Register on sup_page_table */
+        if(!page_register_mmapped(uaddr, mmap_fd, length))
+        {
+          f->eax = -1;
+          break;
+        }
+
+        /* Register on mmap_table */
+        entry = malloc(sizeof(struct mmap_list_entry));
+        entry->uaddr = uaddr;
+        entry->page_cnt = page_cnt;
+        entry->original_fd = fd;
+        entry->fd = mmap_fd;
+        entry->mmap_id = curr->mmap_id_cnt++;
+        list_push_back(&curr->mmap_list, &entry->elem);
+        
+        f->eax = entry->mmap_id;
+        break;
+      }
+    case(SYS_MUNMAP):
+      {
+        int mmap_id = get_user(f->esp+4);
+        int i;
+        struct thread *curr = thread_current();
+        struct mmap_list_entry *entry;
+        struct file **fd_table = curr->fd_table;
+
+        entry = find_mmap_by_id(mmap_id);
+        
+        if(!entry)
+        {
+          f->eax = -1;
+          break;
+        }
+        
+        /* Now, entry corresponds to mmap_id */
+        page_unregister_mmapped(entry->uaddr, entry->page_cnt);
+        file_close(fd_table[entry->fd]);
+        fd_table[entry->fd] = NULL;
+        list_remove(&entry->elem);
+        free(entry);
+
+        break;
+      }
+    case(SYS_CHDIR):
+      {
+        const char *dir_name = get_user(f->esp+4);
+
+        struct dir *parent_dir;
+        struct inode *target_dir_inode;
+        char name[16];
+
+        get_user(dir_name);
+
+        if(!strcmp(dir_name, ".."))
+          name[0] = 'a';
+
+        /* parse path and get directory and name */
+        if( !path_parse(dir_name, &parent_dir, name) )
+        {
+          f->eax = false;
+          break;
+        }
+        
+        /* check if target dir exists */
+        if( !dir_lookup(parent_dir, name, &target_dir_inode) )
+        {
+          dir_close(parent_dir);
+          f->eax = false;
+          break;
+        }
+
+        /* check if target_dir_inode is directory */
+        if( !inode_is_dir(target_dir_inode) )
+        {
+          inode_close(target_dir_inode);
+          dir_close(parent_dir);
+          f->eax = false;
+          break;
+        }
+
+        /* switch cwd */
+        dir_close(thread_current()->cwd);
+        thread_current()->cwd = dir_open(target_dir_inode);
+        dir_close(parent_dir);
+        f->eax = true;
+        break;
+      }
+    case(SYS_MKDIR):
+      {
+        const char *dir_name = get_user(f->esp+4);
+
+        get_user(dir_name);
+
+        f->eax = filesys_create(dir_name, 0, DIR_F);
+        break;
+      }
+    case(SYS_READDIR):
+      {
+        int fd = get_user(f->esp+4);
+        uint8_t *name = get_user(f->esp+8);
+        struct file **fd_table = thread_current()->fd_table;
+        struct dir_entry e;
+        bool found = false;
+       
+        get_user(name);
+        
+        /* Invalid fd */
+        if(fd<2 || fd>=100 || fd_table[fd]==NULL)
+        {
+          f->eax = false;
+          break;
+        }
+        
+        while(file_read(fd_table[fd], &e, sizeof e)==sizeof e)
+        {
+          if(e.in_use && strcmp("..", e.name))
+          {
+            strlcpy(name, e.name, NAME_MAX + 1);
+            found = true;
+            break;
+          }
+        }
+
+        f->eax = found;
+        break;
+      }
+    case(SYS_ISDIR):
+      {
+        int fd = get_user(f->esp+4);
+        struct file **fd_table = thread_current()->fd_table;
+
+        /* Invalid fd */
+        if(fd<2 || fd>=100 || fd_table[fd] == NULL)
+        {
+          f->eax = false;
+          break;
+        }
+
+        f->eax = inode_is_dir(file_get_inode(fd_table[fd]));
+        break;
+      }
+    case(SYS_INUMBER):
+      {
+        int fd = get_user(f->esp+4);
+        struct file **fd_table = thread_current()->fd_table;
+
+        /* Invalid fd */
+        if(fd<2 || fd>=100 || fd_table[fd] == NULL)
+        {
+          f->eax = -1;
+          break;
+        }
+        
+        f->eax = file_get_inode(fd_table[fd])->sector;
+        break;
+      }
+  }
+}
+
+
+static struct mmap_list_entry *
+find_mmap_by_id(int mmap_id)
+{
+  struct list_elem *e;
+  struct list *mmap_list = &thread_current()->mmap_list;
+  struct mmap_list_entry *entry;
+
+  /* Find mmap_list_entry corresponding to MMAP_ID */
+  for(e = list_begin(mmap_list); e != list_end(mmap_list);e = list_next(e))
+  {
+    entry = list_entry(e, struct mmap_list_entry, elem);
+
+    if(entry->mmap_id == mmap_id)
+      return entry;
+  }
+
+  return NULL;
+}
+
+static struct mmap_list_entry *
+find_mmap_by_fd(int fd)
+{
+  struct list_elem *e;
+  struct list *mmap_list = &thread_current()->mmap_list;
+  struct mmap_list_entry *entry;
+
+  /* Find mmap_list_entry corresponding to MMAP_ID */
+  for(e = list_begin(mmap_list); e != list_end(mmap_list);e = list_next(e))
+  {
+    entry = list_entry(e, struct mmap_list_entry, elem);
+
+    if(entry->original_fd == fd)
+      return entry;
+  }
+
+  return NULL;
+}
+
+static void
+exit(int status)
+{
+  thread_current()->exit_status = status;
+  thread_exit();
+}
+
+/* VERY IMPORTANT: syscall arg cannot be -1 (except for exit */
+
+/* Reads integer(should not be -1!!!) at user virtual address UADDR.
+   UADDR must be below PHYS_BASE.
+   Returns the integer value if successful, -1 if a segfault
+   occurred or uaddr is above PHYS_BASE. */
+static int
+get_user (const uint8_t *uaddr)
+{
+  int result;
+  if(uaddr>=PHYS_BASE)
+    return -1;
+  asm ("movl $1f, %0; movl %1, %0; 1:"
+       : "=&a" (result) : "m" (*uaddr));
+  return result;
+}
+/* Writes BYTE to user address UDST.
+   UDST must be below PHYS_BASE.
+   Returns true if successful, false if a segfault occurred.
+   or udst is above PHYS_BASE. */
+static bool
+put_user (uint8_t *udst, uint8_t byte)
+{
+  int error_code;
+  if(udst>=PHYS_BASE)
+    return false;
+
+  asm ("movl $1f, %0; movb %b2, %1; 1:"
+       : "=&a" (error_code), "=m" (*udst) : "r" (byte));
+  return error_code != -1;
+}
